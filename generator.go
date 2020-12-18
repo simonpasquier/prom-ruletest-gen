@@ -127,6 +127,11 @@ func (g *Generator) ProcessRecordingRules(keep func(string) bool) ([]testGroup, 
 			EvalTime:   model.Duration(5 * time.Minute),
 			ExpSamples: nil,
 		}
+		// TODO: reverse the order of queries, we need first to retrieve
+		// (value, timestamp) for the last recorded value (e.g. `name[5m]`
+		// because `name` alone would have a timestamp of eval time).
+		// Then we should query samples for the input timeseries at the given
+		// timestamp, again using a range vector to get the exact timestamps.
 		res, _, err := v1.NewAPI(g.client).Query(g.ctx, name, end)
 		if err != nil {
 			return nil, err
