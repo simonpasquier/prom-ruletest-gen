@@ -29,13 +29,18 @@ import (
 )
 
 var (
-	help        bool
 	promURL     string
 	caFile      string
 	tokenFile   string
 	insecureTLS bool
 
 	recordingRules = rules{}
+	alertingRules  = rules{}
+
+	commands = map[string]func(ctx context.Context) error{
+		"generate": generate,
+		"inspect":  inspect,
+	}
 )
 
 type rules map[string]struct{}
@@ -61,35 +66,79 @@ func (r rules) asSlice() []string {
 	return rules
 }
 
-func registerFlags() {
-	flag.BoolVar(&help, "help", false, "Help message")
-	flag.StringVar(&promURL, "url", "", "Prometheus base URL")
-	flag.StringVar(&caFile, "ca", "", "Path to the Prometheus CA")
-	flag.StringVar(&tokenFile, "token", "", "Path to the bearer token used for authentication")
-	flag.BoolVar(&insecureTLS, "insecure", false, "Don't check certificate validity")
-	flag.Var(&recordingRules, "recording-rule", "Recording rule for which to generate test data (can be repeated). If empty all recording rules are selected.")
+func registerFlags(f *flag.FlagSet) {
+	f.StringVar(&promURL, "url", "", "Prometheus base URL")
+	f.StringVar(&caFile, "ca", "", "Path to the Prometheus CA")
+	f.StringVar(&tokenFile, "token-file", "", "Path to the bearer token used for authentication")
+	f.BoolVar(&insecureTLS, "insecure", false, "Don't check certificate validity")
+	f.Var(&recordingRules, "recording-rule", "Recording rule to select (can be repeated). If empty all recording rules are selected.")
+	f.Var(&alertingRules, "alerting-rule", "Alerting rule to select (can be repeated). If empty all alerting rules are selected.")
 }
 
 func main() {
-	registerFlags()
-	flag.Parse()
+	fset := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	fset.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Prometheus rule inspector and test generator")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "  [FLAGS] (generate|inspect)")
+		fmt.Fprintln(os.Stderr)
+		fset.PrintDefaults()
+	}
+	registerFlags(fset)
 
-	if help {
-		fmt.Fprintln(os.Stderr, "Generator for Prometheus rule tests")
-		flag.PrintDefaults()
+	err := fset.Parse(os.Args[1:])
+	if err == flag.ErrHelp {
 		os.Exit(0)
 	}
 
-	if err := run(context.Background()); err != nil {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error parsing command-line arguments:", err)
+		os.Exit(2)
+	}
+
+	if promURL == "" {
+		fmt.Fprintln(os.Stderr, "missing '-url' argument")
+		os.Exit(2)
+	}
+
+	if len(fset.Args()) > 1 {
+		fmt.Fprintln(os.Stderr, "can only pass one command")
+		os.Exit(2)
+	}
+
+	cmd := fset.Arg(0)
+	if cmd == "" {
+		cmd = "inspect"
+	}
+
+	fn, found := commands[cmd]
+	if !found {
+		fmt.Fprintln(os.Stderr, "invalid command:", cmd)
+		os.Exit(2)
+	}
+
+	if err := fn(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 }
 
-func run(ctx context.Context) error {
-	if promURL == "" {
-		return errors.New("Missing -url parameter")
+func inspect(ctx context.Context) error {
+	client, err := NewClient(ctx, promURL, tokenFile)
+	if err != nil {
+		return err
 	}
+	inspector := NewInspector(client)
+
+	// List alerting/recording rules.
+	// List metrics used by alerting/recording rules (+ distinguish between scraped and recorded metrics).
+	// For each metric, list cardinality information.
+	inspector.RecordingRules()
+
+	return nil
+}
+
+func generate(ctx context.Context) error {
 	u, err := url.Parse(promURL)
 	if err != nil {
 		return errors.Wrap(err, "Invalid URL")
@@ -98,7 +147,15 @@ func run(ctx context.Context) error {
 		return errors.Errorf("Invalid URL scheme: %s", u.Scheme)
 	}
 
-	client, err := api.NewClient(api.Config{Address: promURL})
+	rt := api.DefaultRoundTripper
+	if tokenFile != "" {
+		rt = &bearerTokenRoundTripper{
+			tokenFile: tokenFile,
+			next:      rt,
+		}
+	}
+
+	client, err := api.NewClient(api.Config{Address: promURL, RoundTripper: rt})
 	if err != nil {
 		return err
 	}

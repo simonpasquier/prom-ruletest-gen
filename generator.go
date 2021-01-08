@@ -67,6 +67,7 @@ func (g *Generator) ProcessRecordingRules(keep func(string) bool) ([]testGroup, 
 		seriesSet  = map[string][]float64{}
 		end        = time.Now()
 		start      = end.Add(-5 * time.Minute)
+		evalTime   time.Time
 	)
 
 	for name, rules := range g.recordingRules {
@@ -74,6 +75,34 @@ func (g *Generator) ProcessRecordingRules(keep func(string) bool) ([]testGroup, 
 			continue
 		}
 
+		promqlTest := promqlTestCase{
+			Expr:       name,
+			EvalTime:   model.Duration(5 * time.Minute),
+			ExpSamples: nil,
+		}
+
+		res, _, err := v1.NewAPI(g.client).Query(g.ctx, fmt.Sprintf("%s[5m]", name), end)
+		if err != nil {
+			return nil, err
+		}
+		mat := res.(model.Matrix)
+		if len(mat) == 0 {
+			return nil, errors.Errorf("found 0 samples for %s over the last 5 minutes", name)
+		}
+		for _, sampleStream := range mat {
+			if evalTime.IsZero() {
+				evalTime = sampleStream.Values[len(sampleStream.Values)-1].Timestamp.Time()
+			}
+			promqlTest.ExpSamples = append(
+				promqlTest.ExpSamples,
+				sample{
+					Labels: sampleStream.Metric.String(),
+					Value:  float64(sampleStream.Values[len(sampleStream.Values)-1].Value),
+				},
+			)
+		}
+
+		// Retrieve samples used to compute the recorded value.
 		for _, rule := range rules {
 			queries, err := g.getQueries(rule.Query)
 			if err != nil {
@@ -81,7 +110,7 @@ func (g *Generator) ProcessRecordingRules(keep func(string) bool) ([]testGroup, 
 			}
 
 			for _, q := range queries {
-				res, _, err := v1.NewAPI(g.client).QueryRange(g.ctx, q, v1.Range{Start: start, End: end, Step: time.Minute})
+				res, _, err := v1.NewAPI(g.client).QueryRange(g.ctx, q, v1.Range{Start: start, End: evalTime, Step: time.Minute})
 				if err != nil {
 					return nil, err
 				}
@@ -121,32 +150,6 @@ func (g *Generator) ProcessRecordingRules(keep func(string) bool) ([]testGroup, 
 			input = append(input, inputSerie)
 		}
 
-		// Inject expected PromQL test case.
-		promqlTest := promqlTestCase{
-			Expr:       name,
-			EvalTime:   model.Duration(5 * time.Minute),
-			ExpSamples: nil,
-		}
-		// TODO: reverse the order of queries, we need first to retrieve
-		// (value, timestamp) for the last recorded value (e.g. `name[5m]`
-		// because `name` alone would have a timestamp of eval time).
-		// Then we should query samples for the input timeseries at the given
-		// timestamp, again using a range vector to get the exact timestamps.
-		res, _, err := v1.NewAPI(g.client).Query(g.ctx, name, end)
-		if err != nil {
-			return nil, err
-		}
-		vec := res.(model.Vector)
-		for _, s := range vec {
-			promqlTest.ExpSamples = append(
-				promqlTest.ExpSamples,
-				sample{
-					Labels: s.Metric.String(),
-					Value:  float64(s.Value),
-				},
-			)
-		}
-
 		testGroups = append(
 			testGroups,
 			testGroup{
@@ -176,12 +179,13 @@ func (v visitor) Visit(node parser.Node, _ []parser.Node) (parser.Visitor, error
 			return v, nil
 		}
 		v.queries[n.Name] = append(v.queries[n.Name], n.String())
-		// TODO: check for range selector.
 	default:
+		// TODO: check for RangeSelector to know how far we need to lookback when collecting samples.
 	}
 	return v, nil
 }
 
+// getQueries returns the list of timeseries used by the rule query.
 func (g *Generator) getQueries(rule string) ([]string, error) {
 	expr, err := parser.ParseExpr(rule)
 	if err != nil {
@@ -191,7 +195,8 @@ func (g *Generator) getQueries(rule string) ([]string, error) {
 	v := visitor{
 		queries: make(map[string][]string),
 		keep: func(name string) bool {
-			// Skip metrics that are already generated from recording rules.
+			// Skip metrics that are generated from recording rules.
+			// We want to keep the scraped metrics only.
 			_, found := g.recordingRules[name]
 			return !found
 		},
